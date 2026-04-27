@@ -4,13 +4,82 @@
 #include <Arduino.h>
 #include "WS_ETH.h"
 #include "WS_GPIO.h"
+#include "WS_MDNS.h"
 #include <SPI.h>
 #include <ArduinoOSCETH.h>
 #include "WS_Relay.h"
 
+constexpr uint16_t kOscListenPort = 53000;
+constexpr uint32_t kDinPollIntervalMs = 100;
+constexpr uint8_t kDinCount = 8;
+constexpr uint8_t kDinPins[kDinCount] = {4, 5, 6, 7, 8, 9, 10, 11};
+char gChipId[7] = "000000";
+
 // Trigger timers
 unsigned long triggerTimers[8] = {0};
 bool triggerActive[8] = {false};
+bool dinStates[kDinCount] = {false};
+unsigned long lastDinPollMs = 0;
+
+bool readDinActive(uint8_t pin) {
+  // The DIN example uses INPUT_PULLUP with inverted logic.
+  return digitalRead(pin) == LOW;
+}
+
+void sendDinOsc(uint8_t channel) {
+  if (!ETH_Connected()) {
+    Serial.printf("DIN %d TRIGGERED, OSC skipped because Ethernet is not connected\n", channel);
+    return;
+  }
+  if (!MDNS_QlabAvailable()) {
+    Serial.printf("DIN %d TRIGGERED, OSC skipped because QLab mDNS target is not available\n", channel);
+    return;
+  }
+
+  String address = "/cue/" + String(gChipId) + "-" + String(channel) + "/go";
+  size_t qlabCount = MDNS_QlabCount();
+  for (size_t i = 0; i < qlabCount; ++i) {
+    IPAddress qlabIp = MDNS_QlabIP(i);
+    uint16_t qlabPort = MDNS_QlabPort(i);
+    String qlabIpString = qlabIp.toString();
+    OscEther.send(qlabIpString, qlabPort, address);
+    Serial.printf("OSC sent to QLab %u at %s:%u %s\n",
+                  static_cast<unsigned>(i + 1),
+                  qlabIpString.c_str(),
+                  qlabPort,
+                  address.c_str());
+  }
+}
+
+void initDinInputs() {
+  for (uint8_t i = 0; i < kDinCount; ++i) {
+    pinMode(kDinPins[i], INPUT_PULLUP);
+    dinStates[i] = readDinActive(kDinPins[i]);
+    Serial.printf("DIN %d initial state: %s\n", i + 1, dinStates[i] ? "TRIGGERED" : "IDLE");
+  }
+}
+
+void pollDinInputs() {
+  unsigned long now = millis();
+  if (now - lastDinPollMs < kDinPollIntervalMs) {
+    return;
+  }
+  lastDinPollMs = now;
+
+  for (uint8_t i = 0; i < kDinCount; ++i) {
+    bool currentState = readDinActive(kDinPins[i]);
+    uint8_t channel = i + 1;
+
+    if (currentState != dinStates[i]) {
+      dinStates[i] = currentState;
+      Serial.printf("DIN %d %s\n", channel, currentState ? "TRIGGERED" : "RELEASED");
+    }
+
+    if (currentState) {
+      sendDinOsc(channel);
+    }
+  }
+}
 
 // OSC callback function for relays
 void relayCallback(const OscMessage& m) {
@@ -81,6 +150,9 @@ void setup() {
   }
   Serial.println("Relay test complete");
 
+  Serial.println("Initializing digital inputs...");
+  initDinInputs();
+
   RGB_Light(0, 0, 255); // Blue
   delay(200);
 
@@ -88,6 +160,7 @@ void setup() {
   Serial.println("Building hostname...");
   uint64_t chipid = ESP.getEfuseMac();
   uint32_t id = (uint32_t)(chipid & 0xFFFFFF);
+  snprintf(gChipId, sizeof(gChipId), "%06X", id);
   char hostname[24];
   snprintf(hostname, sizeof(hostname), "relay8-%06X", id);
   Serial.print("Hostname: ");
@@ -96,6 +169,7 @@ void setup() {
   // Initialize native ESP32 Ethernet using the Waveshare wiring.
   Serial.println("Initializing Ethernet...");
   ETH_SetHostname(hostname);
+  MDNS_Configure(hostname, kOscListenPort);
   ETH_Init();
   
   // Wait for Ethernet to get IP
@@ -116,9 +190,10 @@ void setup() {
   }
 
   // Subscribe to OSC messages on port 53000
-  OscEther.subscribe(53000, "/relay/*", relayCallback);
+  OscEther.subscribe(kOscListenPort, "/relay/*", relayCallback);
 
-  Serial.println("OSC TCP server started on port 53000");
+  Serial.printf("OSC TCP server started on port %u\n", kOscListenPort);
+  Serial.println("DIN OSC target: browsing for _qlab._udp via mDNS");
 
   RGB_Light(0, 255, 0); // Green
   delay(200);
@@ -130,6 +205,10 @@ void loop() {
 
   // Update Ethernet status
   ETH_Loop();
+  MDNS_Loop();
+
+  // Poll DIN inputs for edge-triggered logging + OSC
+  pollDinInputs();
 
   // Handle trigger timers
   unsigned long currentMillis = millis();

@@ -10,6 +10,8 @@ Firmware for the Waveshare `ESP32-S3-ETH-8DI-8RO-C` industrial controller board.
 - Starts Ethernet on the `ESP32-S3-ETH-8DI-8RO-C` using the W5500.
 - Builds a unique hostname from the ESP32 MAC address in the form `relay8-XXXXXX`.
 - Listens for OSC messages on TCP port `53000`.
+- Advertises the OSC TCP listener over mDNS as `_osc._tcp`.
+- Discovers QLab over mDNS by browsing `_qlab._udp`.
 - Supports three relay actions per channel:
   - `0` = turn relay off
   - `1` = turn relay on
@@ -118,6 +120,7 @@ On boot, the firmware:
 4. Performs a short relay test on channels 1 through 8.
 5. Starts Ethernet and waits briefly for a DHCP lease.
 6. Starts the OSC TCP listener on port `53000`.
+7. Starts mDNS advertising and searches for QLab on the local network.
 
 If Ethernet is not ready within the initial timeout, the firmware continues running and keeps servicing Ethernet events in the main loop.
 
