@@ -8,6 +8,7 @@ namespace {
 
 constexpr uint32_t kQlabQueryIntervalMs = 5000;
 constexpr size_t kMaxQlabTargets = 8;
+constexpr uint32_t kQlabStaleTimeoutMs = 30000;
 
 String gHostname = "esp32-eth0";
 uint16_t gOscTcpPort = 53000;
@@ -16,9 +17,11 @@ unsigned long gLastQueryMs = 0;
 IPAddress gQlabIps[kMaxQlabTargets];
 uint16_t gQlabPorts[kMaxQlabTargets] = {0};
 size_t gQlabCount = 0;
+unsigned long gLastResolvedQlabMs = 0;
 
 void clearQlabTargets() {
   gQlabCount = 0;
+  gLastResolvedQlabMs = 0;
   for (size_t i = 0; i < kMaxQlabTargets; ++i) {
     gQlabIps[i] = IPAddress();
     gQlabPorts[i] = 0;
@@ -118,12 +121,29 @@ void discoverQlab() {
     }
   }
 
-  clearQlabTargets();
+  if (nextCount == 0) {
+    bool hadCachedTargets = gQlabCount != 0;
+    bool cacheExpired = hadCachedTargets && gLastResolvedQlabMs != 0 &&
+                        now - gLastResolvedQlabMs >= kQlabStaleTimeoutMs;
+    if (cacheExpired) {
+      clearQlabTargets();
+      Serial.println("QLab mDNS results had no IPv4 address, clearing stale cached targets");
+    } else {
+      Serial.println("QLab mDNS results had no IPv4 address, keeping last resolved target(s)");
+    }
+    return;
+  }
+
+  for (size_t i = 0; i < kMaxQlabTargets; ++i) {
+    gQlabIps[i] = IPAddress();
+    gQlabPorts[i] = 0;
+  }
   for (size_t i = 0; i < nextCount; ++i) {
     gQlabIps[i] = nextIps[i];
     gQlabPorts[i] = nextPorts[i];
   }
   gQlabCount = nextCount;
+  gLastResolvedQlabMs = now;
 
   if (changed && gQlabCount != 0) {
     Serial.printf("QLab targets discovered: %u\n", static_cast<unsigned>(gQlabCount));
@@ -135,9 +155,6 @@ void discoverQlab() {
     }
   }
 
-  if (gQlabCount == 0) {
-    Serial.println("QLab mDNS results had no IPv4 address");
-  }
 }
 
 }  // namespace
