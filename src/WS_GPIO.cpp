@@ -102,7 +102,7 @@ void Set_Dutyfactor(uint16_t dutyfactor)
   if(dutyfactor > Dutyfactor_MAX || dutyfactor < 0)
     printf("Set Backlight parameters in the range of 0 to %d \r\n",Dutyfactor_MAX);
   else{
-    ledcWrite(GPIO_PIN_Buzzer, dutyfactor);
+    ledcWrite(PWM_Channel, dutyfactor);
   }
 }
 void Buzzer_Open(void)  

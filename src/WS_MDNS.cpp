@@ -10,8 +10,8 @@ namespace {
 
 constexpr uint32_t kQlabQueryIntervalMs = 5000;
 constexpr uint32_t kMdnsTaskIntervalMs = 250;
+constexpr uint32_t kQlabHostResolveTimeoutMs = 1200;
 constexpr size_t kMaxQlabTargets = 8;
-constexpr uint32_t kQlabStaleTimeoutMs = 30000;
 constexpr size_t kIpStringLength = 16;
 
 String gHostname = "esp32-eth0";
@@ -22,21 +22,8 @@ IPAddress gQlabIps[kMaxQlabTargets];
 char gQlabIpStrings[kMaxQlabTargets][kIpStringLength] = {};
 uint16_t gQlabPorts[kMaxQlabTargets] = {0};
 size_t gQlabCount = 0;
-unsigned long gLastResolvedQlabMs = 0;
 TaskHandle_t gMdnsTaskHandle = nullptr;
 portMUX_TYPE gQlabTargetsMux = portMUX_INITIALIZER_UNLOCKED;
-
-void clearQlabTargets() {
-  portENTER_CRITICAL(&gQlabTargetsMux);
-  gQlabCount = 0;
-  gLastResolvedQlabMs = 0;
-  for (size_t i = 0; i < kMaxQlabTargets; ++i) {
-    gQlabIps[i] = IPAddress();
-    gQlabIpStrings[i][0] = '\0';
-    gQlabPorts[i] = 0;
-  }
-  portEXIT_CRITICAL(&gQlabTargetsMux);
-}
 
 void stopMdns() {
   if (!gMdnsStarted) {
@@ -46,7 +33,6 @@ void stopMdns() {
   MDNS.end();
   gMdnsStarted = false;
   gLastQueryMs = 0;
-  clearQlabTargets();
   Serial.println("mDNS stopped");
 }
 
@@ -73,6 +59,61 @@ void startMdns() {
   Serial.printf("Advertising _osc._tcp on port %u\n", gOscTcpPort);
 }
 
+IPAddress resolveQlabServiceIp(int serviceIndex) {
+  IPAddress ip = MDNS.IP(serviceIndex);
+  if (ip) {
+    return ip;
+  }
+
+  String hostName = MDNS.hostname(serviceIndex);
+  if (hostName.length() == 0) {
+    return IPAddress();
+  }
+  if (hostName.endsWith(".local")) {
+    hostName.remove(hostName.length() - 6);
+  }
+
+  return MDNS.queryHost(hostName, kQlabHostResolveTimeoutMs);
+}
+
+bool addQlabTarget(IPAddress ip, uint16_t port, char *ipString, size_t ipStringSize) {
+  if (!ip || port == 0 || ipString == nullptr || ipStringSize == 0) {
+    return false;
+  }
+
+  char candidateIpString[kIpStringLength];
+  snprintf(candidateIpString,
+           sizeof(candidateIpString),
+           "%u.%u.%u.%u",
+           ip[0],
+           ip[1],
+           ip[2],
+           ip[3]);
+
+  portENTER_CRITICAL(&gQlabTargetsMux);
+  for (size_t i = 0; i < gQlabCount; ++i) {
+    if (gQlabIps[i] == ip && gQlabPorts[i] == port) {
+      portEXIT_CRITICAL(&gQlabTargetsMux);
+      return false;
+    }
+  }
+
+  if (gQlabCount >= kMaxQlabTargets) {
+    portEXIT_CRITICAL(&gQlabTargetsMux);
+    return false;
+  }
+
+  size_t index = gQlabCount;
+  gQlabIps[index] = ip;
+  strlcpy(gQlabIpStrings[index], candidateIpString, sizeof(gQlabIpStrings[index]));
+  gQlabPorts[index] = port;
+  ++gQlabCount;
+  portEXIT_CRITICAL(&gQlabTargetsMux);
+
+  strlcpy(ipString, candidateIpString, ipStringSize);
+  return true;
+}
+
 void discoverQlab() {
   if (!gMdnsStarted) {
     return;
@@ -86,99 +127,31 @@ void discoverQlab() {
 
   int serviceCount = MDNS.queryService("qlab", "udp");
   if (serviceCount <= 0) {
-    if (gQlabCount != 0) {
-      Serial.println("QLab mDNS services disappeared");
+    if (MDNS_QlabAvailable()) {
+      Serial.println("QLab mDNS services disappeared, keeping cached target(s)");
+    } else {
+      Serial.println("Browsing for _qlab._udp: no services found");
     }
-    clearQlabTargets();
-    Serial.println("Browsing for _qlab._udp: no services found");
     return;
   }
 
-  IPAddress nextIps[kMaxQlabTargets];
-  char nextIpStrings[kMaxQlabTargets][kIpStringLength] = {};
-  uint16_t nextPorts[kMaxQlabTargets] = {0};
-  size_t nextCount = 0;
+  size_t addedCount = 0;
 
   for (int i = 0; i < serviceCount; ++i) {
-    IPAddress candidateIp = MDNS.IP(i);
+    IPAddress candidateIp = resolveQlabServiceIp(i);
     uint16_t candidatePort = MDNS.port(i);
-    if (!candidateIp || candidatePort == 0 || nextCount >= kMaxQlabTargets) {
+    char candidateIpString[kIpStringLength] = {};
+    if (!addQlabTarget(candidateIp, candidatePort, candidateIpString, sizeof(candidateIpString))) {
       continue;
     }
 
-    bool duplicate = false;
-    for (size_t j = 0; j < nextCount; ++j) {
-      if (nextIps[j] == candidateIp && nextPorts[j] == candidatePort) {
-        duplicate = true;
-        break;
-      }
-    }
-    if (duplicate) {
-      continue;
-    }
-
-    nextIps[nextCount] = candidateIp;
-    snprintf(nextIpStrings[nextCount],
-             sizeof(nextIpStrings[nextCount]),
-             "%u.%u.%u.%u",
-             candidateIp[0],
-             candidateIp[1],
-             candidateIp[2],
-             candidateIp[3]);
-    nextPorts[nextCount] = candidatePort;
-    ++nextCount;
+    ++addedCount;
+    Serial.printf("QLab target added: %s:%u\n", candidateIpString, candidatePort);
   }
 
-  portENTER_CRITICAL(&gQlabTargetsMux);
-  bool changed = nextCount != gQlabCount;
-  if (!changed) {
-    for (size_t i = 0; i < nextCount; ++i) {
-      if (nextIps[i] != gQlabIps[i] || nextPorts[i] != gQlabPorts[i]) {
-        changed = true;
-        break;
-      }
-    }
+  if (addedCount == 0 && !MDNS_QlabAvailable()) {
+    Serial.println("QLab mDNS results had no IPv4 address");
   }
-
-  if (nextCount == 0) {
-    bool hadCachedTargets = gQlabCount != 0;
-    bool cacheExpired = hadCachedTargets && gLastResolvedQlabMs != 0 &&
-                        now - gLastResolvedQlabMs >= kQlabStaleTimeoutMs;
-    if (cacheExpired) {
-      portEXIT_CRITICAL(&gQlabTargetsMux);
-      clearQlabTargets();
-      Serial.println("QLab mDNS results had no IPv4 address, clearing stale cached targets");
-    } else {
-      portEXIT_CRITICAL(&gQlabTargetsMux);
-      Serial.println("QLab mDNS results had no IPv4 address, keeping last resolved target(s)");
-    }
-    return;
-  }
-
-  for (size_t i = 0; i < kMaxQlabTargets; ++i) {
-    gQlabIps[i] = IPAddress();
-    gQlabIpStrings[i][0] = '\0';
-    gQlabPorts[i] = 0;
-  }
-  for (size_t i = 0; i < nextCount; ++i) {
-    gQlabIps[i] = nextIps[i];
-    strlcpy(gQlabIpStrings[i], nextIpStrings[i], sizeof(gQlabIpStrings[i]));
-    gQlabPorts[i] = nextPorts[i];
-  }
-  gQlabCount = nextCount;
-  gLastResolvedQlabMs = now;
-  portEXIT_CRITICAL(&gQlabTargetsMux);
-
-  if (changed && nextCount != 0) {
-    Serial.printf("QLab targets discovered: %u\n", static_cast<unsigned>(nextCount));
-    for (size_t i = 0; i < nextCount; ++i) {
-      Serial.printf("  QLab %u at %s:%u\n",
-                    static_cast<unsigned>(i + 1),
-                    nextIpStrings[i],
-                    nextPorts[i]);
-    }
-  }
-
 }
 
 void mdnsTask(void *parameter) {

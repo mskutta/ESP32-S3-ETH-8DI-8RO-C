@@ -160,14 +160,14 @@ void setup() {
   Serial.println("Initializing relays...");
   Relay_Init();
 
-  // test relays on startup
-  Serial.println("Testing relays...");
-  for (int i = 1; i <= 8; i++) {
-    Relay_Open(i);
-    delay(100);
-    Relay_Closs(i);
-  }
-  Serial.println("Relay test complete");
+  // // test relays on startup
+  // Serial.println("Testing relays...");
+  // for (int i = 1; i <= 8; i++) {
+  //   Relay_Open(i);
+  //   delay(100);
+  //   Relay_Closs(i);
+  // }
+  // Serial.println("Relay test complete");
 
   Serial.println("Initializing digital inputs...");
   initDinInputs();
@@ -217,6 +217,9 @@ void setup() {
 
   RGB_Light(0, 255, 0); // Green
   delay(200);
+  RGB_Light(0, 0, 0); // Off
+
+  Buzzer_Open_Time(150, 0);
 }
 
 void loop() {
