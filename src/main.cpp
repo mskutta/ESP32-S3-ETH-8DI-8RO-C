@@ -11,9 +11,11 @@
 
 constexpr uint16_t kOscListenPort = 53000;
 constexpr uint32_t kDinPollIntervalMs = 100;
+constexpr bool kLogDinOscSends = true;
 constexpr uint8_t kDinCount = 8;
 constexpr uint8_t kDinPins[kDinCount] = {4, 5, 6, 7, 8, 9, 10, 11};
 char gChipId[7] = "000000";
+char gDinOscAddresses[kDinCount][32] = {};
 
 // Trigger timers
 unsigned long triggerTimers[8] = {0};
@@ -26,28 +28,51 @@ bool readDinActive(uint8_t pin) {
   return digitalRead(pin) == LOW;
 }
 
+void buildDinOscAddresses() {
+  for (uint8_t i = 0; i < kDinCount; ++i) {
+    snprintf(gDinOscAddresses[i],
+             sizeof(gDinOscAddresses[i]),
+             "/cue/%s-%u/go",
+             gChipId,
+             static_cast<unsigned>(i + 1));
+  }
+}
+
 void sendDinOsc(uint8_t channel) {
   if (!ETH_Connected()) {
-    Serial.printf("DIN %d TRIGGERED, OSC skipped because Ethernet is not connected\n", channel);
+    if (kLogDinOscSends) {
+      Serial.printf("DIN %d TRIGGERED, OSC skipped because Ethernet is not connected\n", channel);
+    }
     return;
   }
   if (!MDNS_QlabAvailable()) {
-    Serial.printf("DIN %d TRIGGERED, OSC skipped because QLab mDNS target is not available\n", channel);
+    if (kLogDinOscSends) {
+      Serial.printf("DIN %d TRIGGERED, OSC skipped because QLab mDNS target is not available\n", channel);
+    }
     return;
   }
 
-  String address = "/cue/" + String(gChipId) + "-" + String(channel) + "/go";
+  if (channel == 0 || channel > kDinCount) {
+    return;
+  }
+
+  const char *address = gDinOscAddresses[channel - 1];
   size_t qlabCount = MDNS_QlabCount();
   for (size_t i = 0; i < qlabCount; ++i) {
-    IPAddress qlabIp = MDNS_QlabIP(i);
-    uint16_t qlabPort = MDNS_QlabPort(i);
-    String qlabIpString = qlabIp.toString();
+    char qlabIpString[16];
+    uint16_t qlabPort = 0;
+    if (!MDNS_QlabTarget(i, qlabIpString, sizeof(qlabIpString), &qlabPort)) {
+      continue;
+    }
+
     OscEther.send(qlabIpString, qlabPort, address);
-    Serial.printf("OSC sent to QLab %u at %s:%u %s\n",
-                  static_cast<unsigned>(i + 1),
-                  qlabIpString.c_str(),
-                  qlabPort,
-                  address.c_str());
+    if (kLogDinOscSends) {
+      Serial.printf("OSC sent to QLab %u at %s:%u %s\n",
+                    static_cast<unsigned>(i + 1),
+                    qlabIpString,
+                    qlabPort,
+                    address);
+    }
   }
 }
 
@@ -99,25 +124,19 @@ void relayCallback(const OscMessage& m) {
     if (value == 0) {
       // Off
       Relay_Closs(relayNum);
-      RGB_Light(255, 0, 0); // Red
-      delay(200);
-      RGB_Light(0, 0, 0);   // Off
+      RGB_Open_Time(255, 0, 0, 200, 0); // Red
       Serial.printf("Relay %d OFF\n", relayIndex + 1);
     } else if (value == 1) {
       // On
       Relay_Open(relayNum);
-      RGB_Light(0, 255, 0); // Green
-      delay(200);
-      RGB_Light(0, 0, 0);   // Off
+      RGB_Open_Time(0, 255, 0, 200, 0); // Green
       Serial.printf("Relay %d ON\n", relayIndex + 1);
     } else if (value == 2) {
       // Trigger: on for 1 second
       Relay_Open(relayNum);
       triggerActive[relayIndex] = true;
       triggerTimers[relayIndex] = millis();
-      RGB_Light(0, 0, 255); // Blue
-      delay(200);
-      RGB_Light(0, 0, 0);   // Off
+      RGB_Open_Time(0, 0, 255, 200, 0); // Blue
       Serial.printf("Relay %d TRIGGER\n", relayIndex + 1);
     }
   }
@@ -161,6 +180,7 @@ void setup() {
   uint64_t chipid = ESP.getEfuseMac();
   uint32_t id = (uint32_t)(chipid & 0xFFFFFF);
   snprintf(gChipId, sizeof(gChipId), "%06X", id);
+  buildDinOscAddresses();
   char hostname[24];
   snprintf(hostname, sizeof(hostname), "relay8-%06X", id);
   Serial.print("Hostname: ");
