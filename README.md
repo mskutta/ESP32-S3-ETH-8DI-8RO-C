@@ -13,6 +13,7 @@ Firmware for the Waveshare ESP32-S3-ETH-8DI-8RO-C industrial controller. It prov
 - Configurable DMX universe/channel and ON/OFF hysteresis thresholds.
 - DMX packet-loss timeout, defaulting to two seconds and turning DMX relays OFF.
 - HTTP configuration page at `http://<device-ip>/` on port 80.
+- OSC 1.1 SLIP TCP input alongside UDP, and browser firmware uploads over Ethernet.
 - Versioned NVS persistence, validation, live status, test controls, and restore defaults.
 
 ## Default OSC Commands
@@ -26,6 +27,16 @@ The default configuration preserves the original relay commands:
 ```
 
 The default OSC listener uses TCP and UDP port `53000`. The web interface can change that port and all relay/input routing rules.
+
+For TCP input, configure QLab (or another sender) for **OSC 1.1 / SLIP**,
+matching the linear actuator controller. Frames begin and end with `0xC0`;
+payload `0xC0` and `0xDB` bytes are escaped as `0xDB 0xDC` and `0xDB 0xDD`.
+TCP input accepts two simultaneous clients, up to 1024 decoded bytes per
+message, and closes connections with an incomplete frame after two seconds.
+Malformed or oversized SLIP frames are discarded through the next END byte.
+Disconnects, Ethernet loss, port changes, and restored defaults reset TCP input.
+Length-prefixed OSC 1.0 TCP input is no longer accepted. UDP input and outbound
+DIN OSC behavior remain unchanged; TCP **output** still uses length prefixes.
 
 ## Web Configuration
 
@@ -70,3 +81,67 @@ pio device monitor
 ```
 
 The PlatformIO environment is `esp32-s3-eth-8di-8ro-c`. Dependencies include ArduinoOSC and ArduinoJson.
+
+## Ethernet firmware updates
+
+**Install this version once over USB with `pio run -t upload`.** This installs
+`partitions.csv`, containing two 7 MiB application slots. Uploading only an
+application binary cannot migrate the previous single-slot partition layout.
+The NVS location is retained; a normal USB upload and subsequent Ethernet
+updates preserve saved settings. Do not erase the flash if you want to retain
+settings.
+
+After USB installation, open `http://<device-ip>/`, find **Firmware update**,
+and select this project's `.pio/build/esp32-s3-eth-8di-8ro-c/firmware.bin`.
+The page asks for confirmation, displays upload progress, and reports the
+result. A successful update reboots after the response. Upload the application
+`firmware.bin`, not a bootloader, partition table, merged image, or firmware
+from a different project.
+
+The equivalent API is `PUT /api/update` with a raw `application/octet-stream`
+body and a positive, exact Content-Length no larger than the inactive slot:
+
+```bash
+curl --fail-with-body -H 'Content-Type: application/octet-stream' -H 'Expect:' \
+  --upload-file .pio/build/esp32-s3-eth-8di-8ro-c/firmware.bin \
+  http://<device-ip>/api/update
+```
+
+Uploads stream in chunks of at most 512 bytes to the inactive slot. They abort
+after 120 seconds total or five seconds without data. Chunked transfer and
+multipart uploads are unsupported. HTTP serves one request at a time, so status,
+configuration, and DIN polling pause during an upload. Already queued outbound
+DIN sends may finish.
+
+Before flash writes, the controller inhibits relay control, cancels pulses,
+clears DMX state, discards pending relay input, and turns all eight relays off.
+An unsuccessful relay-off write rejects the upload before writing firmware.
+Failed, invalid, or interrupted uploads abort without rebooting or selecting
+the new image. Relays successfully turned off stay off until fresh commands
+arrive; previous relay states and pulses are not restored. Pending control
+traffic is discarded when maintenance ends. Successful uploads hold relay
+control inhibited until reboot, when relays initialize off.
+
+Uploads have no password; use the intended show-control network. USB recovery
+remains available. Automatic rollback after an installed image fails to boot
+is not provided.
+
+## Validation
+
+Run `python3 scripts/test_native.py` for the production SLIP receiver, OSC
+packet bounds checker, firmware lifecycle, and HTTP upload adapter with fake
+network/flash backends under AddressSanitizer and UndefinedBehaviorSanitizer.
+Tests include two TCP clients, fragmentation, escaping, coalesced frames,
+malformed/oversized frames, timeout/reconnect/port reset, upload retries,
+relay-off/flash/validation failures, disconnects, idle and total deadlines,
+invalid upload headers, and reboot signaling only after successful validation.
+Run `node scripts/test_web_ui.cjs` to check the embedded browser upload controls,
+including confirmation, progress, success, failure, and connection errors.
+
+Hardware acceptance: send `/relay/1 1`, `/relay/1 0`, and `/relay/1 2` from
+QLab using TCP OSC 1.1 / SLIP and repeat via UDP. Change the listening port and
+restore defaults. With a relay on and a pulse pending, upload firmware and
+verify every relay turns off and stays off throughout upload. Interrupt an
+upload and verify fresh commands work afterward; then complete an update,
+verify reboot, and confirm saved settings survive. Perform these checks with
+loads suitable for a bench test.

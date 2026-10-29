@@ -2,6 +2,8 @@
 #include <ArduinoJson.h>
 #include <ArduinoOSCETH.h>
 #include <WebServer.h>
+#include <Update.h>
+#include <esp_ota_ops.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WiFiServer.h>
@@ -16,6 +18,9 @@
 #include "WS_MDNS.h"
 #include "WS_Relay.h"
 #include "WS_OscText.h"
+#include "WS_OscTcpInput.h"
+#include "WS_OscPacket.h"
+#include "WS_FirmwareHttp.h"
 
 constexpr uint8_t kDinPins[DIN_COUNT] = {4,5,6,7,8,9,10,11};
 constexpr uint16_t kArtNetPort=6454, kSacnPort=5568;
@@ -30,8 +35,13 @@ bool gDinState[DIN_COUNT]={},gDinCandidate[DIN_COUNT]={};
 unsigned long gDinCandidateSince[DIN_COUNT]={},gDinLastSent[DIN_COUNT][DIN_EVENT_COUNT][MAX_DIN_MESSAGES]={},gLastDinPollMs=0;
 unsigned long gPulseTimers[RELAY_COUNT]={}; bool gPulseActive[RELAY_COUNT]={};
 unsigned long gDmxLastPacketMs=0; bool gDmxEverReceived=false;
-WiFiUDP gOscUdp,gArtNetUdp,gSacnUdp; WiFiServer gOscTcpServer(53000); WiFiClient gOscTcpClient;
-WebServer gWebServer(80); uint8_t gSacnPriority[RELAY_COUNT]={},gSacnCid[RELAY_COUNT][16]={};
+WiFiUDP gOscUdp,gArtNetUdp,gSacnUdp;
+OscTcpInput<WiFiServer,WiFiClient> gOscTcpInput(53000);
+bool gMaintenance=false;
+bool gResetHttpAfterUpdate=false;
+uint32_t gRebootAt=0;
+bool gRebootPending=false;
+FirmwareWebServer gWebServer(80); uint8_t gSacnPriority[RELAY_COUNT]={},gSacnCid[RELAY_COUNT][16]={};
 using OscMessage=arduino::osc::message::Message; using OscEncoder=arduino::osc::message::Encoder;
 
 struct TcpOscJob {
@@ -65,15 +75,32 @@ button{padding:8px 13px;border:0;border-radius:5px;background:#0369a1;color:#fff
 pre{white-space:pre-wrap;overflow:auto;background:#0f172a;color:#dbeafe;padding:12px;border-radius:6px;max-height:600px}.status{white-space:pre-wrap;padding:10px;background:#e2e8f0;border-radius:6px}
 </style></head><body><main>
 <header><h1>SpookIO</h1><p>Configure digital inputs, relay control, OSC, Art-Net, and sACN. Changes apply only after Save.</p>
-<nav><a href="#global">Global</a><a href="#inputs">Digital Inputs</a><a href="#relays">Relays</a><a href="#statusSection">Status</a><a href="#advanced">Advanced JSON</a></nav>
+<nav><a href="#global">Global</a><a href="#inputs">Digital Inputs</a><a href="#relays">Relays</a><a href="#statusSection">Status</a><a href="#advanced">Advanced JSON</a><a href="#firmware">Firmware</a></nav>
 <div><button onclick="saveConfig()">Save configuration</button><button class="secondary" onclick="loadConfig()">Reload</button><button class="danger" onclick="restoreDefaults()">Restore defaults</button></div><div id="messages"><div class="status">Loading configuration…</div></div></header>
 <section id="global" class="card"><h2>Global settings</h2><div id="globalForm" class="grid"></div></section>
 <section id="inputs"><h2>Digital inputs</h2><p class="help">Each input has one message for Open and one for Closed. An input is Open when it is not connected to ground and Closed when it is connected to ground. Messages use QLab syntax, for example <code>/cue/1/opacity 0.5</code>.</p><div id="inputForms"></div></section>
 <section id="relays"><h2>Relays</h2><div id="relayForms"></div></section>
 <section id="statusSection" class="card"><h2>Status</h2><div id="status" class="status">Loading...</div></section>
 <details id="advanced"><summary>Advanced JSON preview (read-only)</summary><pre id="jsonPreview"></pre></details>
+<section id="firmware" class="card"><h2>Firmware update</h2><p>Upload this project's firmware.bin over Ethernet. Uploading turns all relays OFF and successful installation reboots. Settings are retained.</p><input id="firmwareFile" type="file" accept=".bin"><button id="uploadButton" onclick="uploadFirmware()">Upload firmware</button><progress id="uploadProgress" max="100" value="0"></progress><div id="uploadStatus" class="status">Ready</div><p class="help">Firmware uploads have no password. Use the intended show-control network. First install the OTA partition layout over USB.</p></section>
 <script>
 let config=null;
+let firmwareUploading=false;
+function uploadFirmware(){
+  let file=$('firmwareFile').files[0];
+  if(!file||!file.size){$('uploadStatus').textContent='Choose a nonempty firmware.bin';return}
+  if(!confirm('Turn all relays OFF and upload firmware? Successful installation reboots.'))return;
+  firmwareUploading=true;$('uploadButton').disabled=true;$('uploadProgress').value=0;
+  $('uploadStatus').textContent='Uploading; relay control is inhibited.';
+  let xhr=new XMLHttpRequest();xhr.open('PUT','/api/update');xhr.timeout=125000;
+  xhr.setRequestHeader('Content-Type','application/octet-stream');
+  xhr.upload.onprogress=e=>{if(e.lengthComputable)$('uploadProgress').value=e.loaded/e.total*100};
+  function done(text){$('uploadStatus').textContent=text;firmwareUploading=false;$('uploadButton').disabled=false}
+  xhr.onload=()=>done(xhr.status===200?'Firmware installed; rebooting. Reload this page shortly.':'Update failed: '+xhr.responseText+' Check relay status before retrying.');
+  xhr.onerror=()=>done('Connection lost. Check the device before retrying; installation may have completed.');
+  xhr.ontimeout=()=>done('Upload timed out. Check the device before retrying.');
+  xhr.send(file);
+}
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 function selected(v,n){return Number(v)===Number(n)?' selected':''}
@@ -84,7 +111,7 @@ async function fetchJson(url){let response=await fetch(url);if(!response.ok)thro
 function inputField(id,label,value,type='text',extra=''){return '<label>'+label+'<input id="'+id+'" type="'+type+'" value="'+esc(value)+'" '+extra+'></label>'}
 function selectField(id,label,value,options){return '<label>'+label+'<select id="'+id+'">'+options.map(x=>'<option value="'+x[0]+'"'+selected(value,x[0])+'>'+x[1]+'</option>').join('')+'</select></label>'}
 function render(){
-  let g='<div>'+inputField('oscPort','OSC listen port',config.oscPort,'number','min="1" max="65535"')+inputField('debounceMs','Input debounce (ms)',config.debounceMs,'number','min="0" max="5000"')+inputField('dmxTimeoutMs','DMX timeout (ms)',config.dmxTimeoutMs,'number','min="100" max="60000"')+'</div><div>'+ '<label><input id="qlabDiscovery" type="checkbox"'+checked(config.qlabDiscovery)+'>Enable QLab discovery</label><p class="help">Art-Net uses UDP 6454. sACN uses UDP 5568.</p></div>';
+  let g='<div>'+inputField('oscPort','OSC listen port',config.oscPort,'number','min="1" max="65535"')+inputField('debounceMs','Input debounce (ms)',config.debounceMs,'number','min="0" max="5000"')+inputField('dmxTimeoutMs','DMX timeout (ms)',config.dmxTimeoutMs,'number','min="100" max="60000"')+'</div><div>'+ '<label><input id="qlabDiscovery" type="checkbox"'+checked(config.qlabDiscovery)+'>Enable QLab discovery</label><p class="help">OSC input uses UDP or TCP OSC 1.1 / SLIP. Art-Net uses UDP 6454. sACN uses UDP 5568.</p></div>';
   $('globalForm').innerHTML=g;
   let ih='';
   for(let i=0;i<8;i++){ih+='<details class="card"><summary><b>Input '+(i+1)+'</b> — current: <span id="din-'+i+'-state">'+(config._status?.din?.[i]||'Unknown')+'</span></summary>';
@@ -128,7 +155,7 @@ function validate(){
 async function saveConfig(){try{collect();if(!validate())return;let r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(config)}),text=await r.text();if(!r.ok)throw new Error(text||('HTTP '+r.status));showNotice(text||'Configuration saved');await loadConfig()}catch(error){showFailure('Save failed',error)}}
 async function loadConfig(){showNotice('Loading configuration…');try{config=await fetchJson('/api/config');let statusError=null;try{await loadStatus()}catch(error){statusError=error}render();if(statusError)showFailure('Configuration loaded, but status failed',statusError);else showNotice('Configuration loaded')}catch(error){showFailure('Configuration could not be rendered',error)}}
 async function restoreDefaults(){if(!confirm('Restore defaults? This replaces the saved configuration.'))return;try{let r=await fetch('/api/defaults',{method:'POST'}),text=await r.text();if(!r.ok)throw new Error(text||('HTTP '+r.status));showNotice(text||'Defaults restored');await loadConfig()}catch(error){showFailure('Restore defaults failed',error)}}
-async function loadStatus(){let s=await fetchJson('/api/status');if(config)config._status=s;if($('status'))$('status').textContent=JSON.stringify(s,null,2);for(let i=0;i<8;i++){let state=$('din-'+i+'-state');if(state)state.textContent=s.din?.[i]||'Unknown'}}
+async function loadStatus(){if(firmwareUploading)return;let s=await fetchJson('/api/status');if(config)config._status=s;if($('status'))$('status').textContent=JSON.stringify(s,null,2);for(let i=0;i<8;i++){let state=$('din-'+i+'-state');if(state)state.textContent=s.din?.[i]||'Unknown'}}
 async function testDin(i,e){if(!confirm('Send the configured '+(e?'Closed':'Open')+' message for input '+(i+1)+'?'))return;try{let r=await fetch('/api/test/din?input='+(i+1)+'&event='+(e?'closed':'open'),{method:'POST'}),text=await r.text();if(!r.ok)throw new Error(text||('HTTP '+r.status));showNotice(text)}catch(error){showFailure('DIN test failed',error)}}
 async function testRelay(i,n){if(!confirm('Execute relay '+(i+1)+' rule '+(n+1)+'? This may change a physical output.'))return;try{let r=await fetch('/api/test/relay?relay='+(i+1)+'&rule='+(n+1),{method:'POST'}),text=await r.text();if(!r.ok)throw new Error(text||('HTTP '+r.status));showNotice(text)}catch(error){showFailure('Relay test failed',error)}}
 window.addEventListener('error',event=>showFailure('Page error',event.error||event.message));window.addEventListener('unhandledrejection',event=>showFailure('Page error',event.reason));
@@ -140,7 +167,7 @@ loadConfig();setInterval(()=>loadStatus().catch(error=>showFailure('Status refre
 // contact state as Open/Closed to the application and API.
 bool readDinClosed(uint8_t pin){return digitalRead(pin)==LOW;}
 const char* dinStateName(bool closed){return closed?"Closed":"Open";}
-void relaySet(uint8_t r,bool on){if(r>=RELAY_COUNT)return;bool ok=on?Relay_Open(r+1):Relay_Closs(r+1);if(ok)Relay_Flag[r]=on;}
+void relaySet(uint8_t r,bool on){if(gMaintenance||r>=RELAY_COUNT)return;bool ok=on?Relay_Open(r+1):Relay_Closs(r+1);if(ok)Relay_Flag[r]=on;}
 void relayPulse(uint8_t r,uint32_t ms){relaySet(r,true);gPulseActive[r]=true;gPulseTimers[r]=millis()+ms;RGB_Open_Time(0,0,255,200,0);}
 void addArg(OscMessage&m,const OscArgumentConfig&a){switch(a.type){case ARG_INT32:m.pushInt32(a.intValue);break;case ARG_FLOAT:m.pushFloat(a.floatValue);break;case ARG_STRING:m.pushString(a.stringValue);break;case ARG_BOOL:m.pushBool(a.boolValue);break;default:break;}}
 bool buildMessage(const char*text,OscMessage&m){ParsedOscText parsed;String error;if(!OscText_Parse(text,parsed,error))return false;m.init(parsed.address);for(uint8_t i=0;i<parsed.argumentCount;i++)addArg(m,parsed.args[i]);return true;}
@@ -204,11 +231,16 @@ void sendDinEvent(uint8_t input,uint8_t event){for(uint8_t n=0;n<MAX_DIN_MESSAGE
 
 bool argMatches(const OscArgumentConfig&e,const OscMessage&m,uint8_t i){if(e.type==ARG_NONE||i>=m.size())return false;if(e.type==ARG_INT32)return m.isInt32(i)&&m.getArgAsInt32(i)==e.intValue;if(e.type==ARG_FLOAT)return m.isFloat(i)&&m.getArgAsFloat(i)==e.floatValue;if(e.type==ARG_STRING)return m.isStr(i)&&m.getArgAsString(i)==e.stringValue;if(e.type==ARG_BOOL)return m.isBool(i)&&m.getArgAsBool(i)==e.boolValue;return false;}
 bool ruleMatches(const RelayOscRuleConfig&r,const OscMessage&m){if(!r.enabled)return false;ParsedOscText expected;String error;if(!OscText_Parse(r.matchMessage,expected,error))return false;if(m.address()!=expected.address)return false;if(r.matchMode==MATCH_ANY_ARGS)return true;if(r.matchMode==MATCH_NO_ARGS)return m.size()==0;if(m.size()!=expected.argumentCount)return false;for(uint8_t i=0;i<expected.argumentCount;i++)if(!argMatches(expected.args[i],m,i))return false;return true;}
-void handleOscMessage(const OscMessage&m){for(uint8_t r=0;r<RELAY_COUNT;r++){if(gConfig.relaySource[r]!=SOURCE_OSC)continue;for(uint8_t n=0;n<MAX_RELAY_RULES;n++){auto&rule=gConfig.relayOsc[r][n];if(!ruleMatches(rule,m))continue;RelayAction action=RelayRuleAction(n);if(action==RELAY_ACTION_OFF){relaySet(r,false);RGB_Open_Time(255,0,0,200,0);}else if(action==RELAY_ACTION_ON){relaySet(r,true);RGB_Open_Time(0,255,0,200,0);}else relayPulse(r,rule.pulseDurationMs);return;}}}
-void handleUdpOsc(){int n;while((n=gOscUdp.parsePacket())>0){if(n>(int)kOscPacketMax){while(gOscUdp.available())gOscUdp.read();continue;}uint8_t b[kOscPacketMax];int len=gOscUdp.read(b,sizeof(b));OscMessage m(b,len);if(m.available())handleOscMessage(m);}}
-void handleTcpOsc(){if(!gOscTcpClient||!gOscTcpClient.connected()){WiFiClient c=gOscTcpServer.available();if(c)gOscTcpClient=c;}static uint8_t frame[kOscPacketMax],header[4],hb=0;static uint16_t expected=0,received=0;while(gOscTcpClient&&gOscTcpClient.available()){if(!expected){header[hb++]=gOscTcpClient.read();if(hb<4)continue;expected=(header[2]<<8)|header[3];hb=0;received=0;if(!expected||expected>kOscPacketMax){gOscTcpClient.stop();expected=0;continue;}}while(expected&&received<expected&&gOscTcpClient.available())frame[received++]=gOscTcpClient.read();if(expected&&received==expected){OscMessage m(frame,expected);if(m.available())handleOscMessage(m);expected=received=0;}}}
+void handleOscMessage(const OscMessage&m){if(gMaintenance)return;for(uint8_t r=0;r<RELAY_COUNT;r++){if(gConfig.relaySource[r]!=SOURCE_OSC)continue;for(uint8_t n=0;n<MAX_RELAY_RULES;n++){auto&rule=gConfig.relayOsc[r][n];if(!ruleMatches(rule,m))continue;RelayAction action=RelayRuleAction(n);if(action==RELAY_ACTION_OFF){relaySet(r,false);RGB_Open_Time(255,0,0,200,0);}else if(action==RELAY_ACTION_ON){relaySet(r,true);RGB_Open_Time(0,255,0,200,0);}else relayPulse(r,rule.pulseDurationMs);return;}}}
+void receiveOscPacket(const uint8_t* data,size_t length){
+  if(gMaintenance||!OscPacketValid(data,length))return;
+  OscMessage message(data,length);
+  if(message.available())handleOscMessage(message);
+}
+void handleUdpOsc(){int n;while((n=gOscUdp.parsePacket())>0){if(n>(int)kOscPacketMax){while(gOscUdp.available())gOscUdp.read();continue;}uint8_t b[kOscPacketMax];int len=gOscUdp.read(b,sizeof(b));if(len>0)receiveOscPacket(b,len);}}
+void handleTcpOsc(){gOscTcpInput.poll(millis(),receiveOscPacket);}
 
-void applyDmx(uint8_t r,uint8_t level,const RelayDmxConfig&map){if(gConfig.relaySource[r]==SOURCE_OSC)return;bool state=Relay_Flag[r];if(level>=map.onLevel)state=true;else if(level<=map.offLevel)state=false;if(state!=Relay_Flag[r])relaySet(r,state);}
+void applyDmx(uint8_t r,uint8_t level,const RelayDmxConfig&map){if(gMaintenance)return;if(gConfig.relaySource[r]==SOURCE_OSC)return;bool state=Relay_Flag[r];if(level>=map.onLevel)state=true;else if(level<=map.offLevel)state=false;if(state!=Relay_Flag[r])relaySet(r,state);}
 void handleArtNet(){int n;while((n=gArtNetUdp.parsePacket())>0){uint8_t p[600];if(n>(int)sizeof(p)){while(gArtNetUdp.available())gArtNetUdp.read();continue;}int len=gArtNetUdp.read(p,sizeof(p));if(len<18||memcmp(p,"Art-Net\0",8)||p[8]!=0||p[9]!=0x50)continue;uint16_t u=p[14]|(p[15]<<8),dl=(p[16]<<8)|p[17];if(dl>512||18+dl>len)continue;gDmxLastPacketMs=millis();gDmxEverReceived=true;for(uint8_t r=0;r<RELAY_COUNT;r++)if(gConfig.relaySource[r]==SOURCE_ARTNET&&gConfig.artnet[r].universe==u&&gConfig.artnet[r].channel<=dl)applyDmx(r,p[17+gConfig.artnet[r].channel],gConfig.artnet[r]);}}
 void handleSacn(){int n;while((n=gSacnUdp.parsePacket())>0){uint8_t p[700];if(n>(int)sizeof(p)){while(gSacnUdp.available())gSacnUdp.read();continue;}int len=gSacnUdp.read(p,sizeof(p));if(len<126||p[0]||p[1]!=0x10||memcmp(p+4,"ASC-E1.17",9))continue;uint16_t u=(p[113]<<8)|p[114],count=((p[123]&15)<<8)|p[124];if(count<2||126+count-1>len)continue;bool accepted=false;for(uint8_t r=0;r<RELAY_COUNT;r++){auto&map=gConfig.sacn[r];if(gConfig.relaySource[r]!=SOURCE_SACN||map.universe!=u||map.channel>count-1)continue;bool same=!memcmp(gSacnCid[r],p+22,16);if(!same&&p[108]<gSacnPriority[r])continue;memcpy(gSacnCid[r],p+22,16);gSacnPriority[r]=p[108];applyDmx(r,p[125+map.channel],map);accepted=true;}if(accepted){gDmxLastPacketMs=millis();gDmxEverReceived=true;}}}
 
@@ -233,12 +265,66 @@ bool configFromJson(JsonDocument&d,DeviceConfig&c,String&e){
   return Config_IsValid(c,e);
 }
 void getConfig(){JsonDocument d;configToJson(d);String out;serializeJson(d,out);gWebServer.send(200,"application/json",out);}
-void restartOscListeners(){gOscUdp.stop();gOscTcpServer.end();gOscUdp.begin(gConfig.oscPort);gOscTcpServer=WiFiServer(gConfig.oscPort);gOscTcpServer.begin();MDNS_Configure(nullptr,gConfig.oscPort);}
-void postConfig(){JsonDocument d;auto err=deserializeJson(d,gWebServer.arg("plain"));if(err){gWebServer.send(400,"text/plain",err.c_str());return;}DeviceConfig next;String why;if(!configFromJson(d,next,why)){gWebServer.send(400,"text/plain",why);return;}uint16_t oldPort=gConfig.oscPort;if(!Config_Save(next)){gWebServer.send(500,"text/plain","NVS save failed");return;}gConfig=next;if(oldPort!=gConfig.oscPort)restartOscListeners();MDNS_SetQlabDiscoveryEnabled(gConfig.qlabDiscovery);gWebServer.send(200,"text/plain","Saved and applied");}
-void restoreDefaults(){Config_Defaults(gConfig);Config_Save(gConfig);MDNS_SetQlabDiscoveryEnabled(gConfig.qlabDiscovery);gWebServer.send(200,"text/plain","Defaults restored");}
-void status(){JsonDocument d;JsonArray a=d["din"].to<JsonArray>(),b=d["relays"].to<JsonArray>();for(bool v:gDinState)a.add(dinStateName(v));for(bool v:Relay_Flag)b.add(v);d["ip"]=ETH_LocalIP().toString();d["qlabCount"]=MDNS_QlabCount();String out;serializeJson(d,out);gWebServer.send(200,"application/json",out);}
-void testDin(){int input=gWebServer.arg("input").toInt()-1;String eventName=gWebServer.arg("event");int event=eventName.equalsIgnoreCase("closed")||eventName.equalsIgnoreCase("low")?1:0;if(input<0||input>=DIN_COUNT||!gConfig.din[input][event][0].enabled){gWebServer.send(400,"text/plain","Invalid or disabled DIN message");return;}sendDinMessage(gConfig.din[input][event][0]);gWebServer.send(200,"text/plain","DIN message sent");}
-void testRelay(){int relay=gWebServer.arg("relay").toInt()-1;int rule=gWebServer.arg("rule").toInt()-1;if(relay<0||relay>=RELAY_COUNT||rule<0||rule>=MAX_RELAY_RULES||!gConfig.relayOsc[relay][rule].enabled){gWebServer.send(400,"text/plain","Invalid or disabled relay rule");return;}auto&r=gConfig.relayOsc[relay][rule];RelayAction action=RelayRuleAction(rule);if(action==RELAY_ACTION_OFF)relaySet(relay,false);else if(action==RELAY_ACTION_ON)relaySet(relay,true);else relayPulse(relay,r.pulseDurationMs);gWebServer.send(200,"text/plain","Relay rule executed");}
+void restartOscListeners(){gOscUdp.stop();gOscUdp.begin(gConfig.oscPort);gOscTcpInput.begin(gConfig.oscPort);MDNS_Configure(nullptr,gConfig.oscPort);}
+// Drop queued network commands when entering/leaving maintenance. Restarting the
+// listeners also closes pending TCP connections and resets every SLIP decoder.
+void discardRelayInput(){
+  restartOscListeners();
+  gArtNetUdp.stop();gArtNetUdp.begin(kArtNetPort);
+  gSacnUdp.stop();gSacnUdp.begin(kSacnPort);
+}
+class DeviceFirmwareBackend : public FirmwareBackend {
+ public:
+  bool enterMaintenance() override {
+    gMaintenance=true;
+    memset(gPulseActive,0,sizeof(gPulseActive));
+    gDmxEverReceived=false;gDmxLastPacketMs=0;
+    memset(gSacnPriority,0,sizeof(gSacnPriority));memset(gSacnCid,0,sizeof(gSacnCid));
+    discardRelayInput();
+    bool ok=true;
+    for(uint8_t r=0;r<RELAY_COUNT;r++){
+      if(Relay_Closs(r+1))Relay_Flag[r]=false;
+      else ok=false;
+    }
+    return ok;
+  }
+  void leaveMaintenance() override {discardRelayInput();gMaintenance=false;gResetHttpAfterUpdate=true;}
+  bool begin(size_t size) override {return ETH_Connected()&&Update.begin(size,U_FLASH);}
+  size_t write(const uint8_t* data,size_t size) override {
+    return ETH_Connected()?Update.write(const_cast<uint8_t*>(data),size):0;
+  }
+  bool finish() override {return ETH_Connected()&&Update.end();}
+  void abort() override {Update.abort();}
+};
+DeviceFirmwareBackend gFirmwareBackend;
+FirmwareUpload gFirmwareUpload(gFirmwareBackend);
+size_t firmwareCapacity(){
+  auto* next=esp_ota_get_next_update_partition(nullptr);
+  auto* running=esp_ota_get_running_partition();
+  return next&&running&&next->address!=running->address?next->size:0;
+}
+void firmwareInstalled(){gRebootPending=true;gRebootAt=millis()+1000;}
 
-void setup(){delay(1000);Serial.begin(115200);gTcpOscQueue=xQueueCreate(kTcpOscQueueLength,sizeof(TcpOscJob));if(gTcpOscQueue!=nullptr)xTaskCreatePinnedToCore(tcpOscTask,"TcpOscTask",4096,nullptr,1,nullptr,1);Config_Load(gConfig);GPIO_Init();I2C_Init();Relay_Init();for(uint8_t i=0;i<8;i++){pinMode(kDinPins[i],INPUT_PULLUP);gDinState[i]=readDinClosed(kDinPins[i]);gDinCandidate[i]=gDinState[i];}uint64_t id=ESP.getEfuseMac();char hostname[24],instanceName[24];snprintf(hostname,sizeof(hostname),"spookio-%06X",(uint32_t)(id&0xffffff));snprintf(instanceName,sizeof(instanceName),"SpookIO-%06X",(uint32_t)(id&0xffffff));ETH_SetHostname(hostname);MDNS_Configure(hostname,gConfig.oscPort,instanceName);ETH_Init();for(uint16_t i=0;!ETH_Connected()&&i<100;i++){ETH_Loop();delay(100);}gOscUdp.begin(gConfig.oscPort);gArtNetUdp.begin(kArtNetPort);gSacnUdp.begin(kSacnPort);gOscTcpServer=WiFiServer(gConfig.oscPort);gOscTcpServer.begin();gWebServer.on("/",HTTP_GET,[](){gWebServer.send_P(200,"text/html; charset=utf-8",kIndexHtml);});gWebServer.on("/api/config",HTTP_GET,getConfig);gWebServer.on("/api/config",HTTP_POST,postConfig);gWebServer.on("/api/defaults",HTTP_POST,restoreDefaults);gWebServer.on("/api/status",HTTP_GET,status);gWebServer.on("/api/test/din",HTTP_POST,testDin);gWebServer.on("/api/test/relay",HTTP_POST,testRelay);gWebServer.begin();MDNS_SetQlabDiscoveryEnabled(gConfig.qlabDiscovery);Serial.printf("OSC TCP/UDP %u, HTTP 80, Art-Net %u, sACN %u\n",gConfig.oscPort,kArtNetPort,kSacnPort);RGB_Light(0,0,0);Buzzer_Open_Time(150,0);}
-void loop(){handleUdpOsc();handleTcpOsc();handleArtNet();handleSacn();gWebServer.handleClient();ETH_Loop();MDNS_Loop();pollDin();updateTimers();}
+void postConfig(){JsonDocument d;auto err=deserializeJson(d,gWebServer.arg("plain"));if(err){gWebServer.send(400,"text/plain",err.c_str());return;}DeviceConfig next;String why;if(!configFromJson(d,next,why)){gWebServer.send(400,"text/plain",why);return;}uint16_t oldPort=gConfig.oscPort;if(!Config_Save(next)){gWebServer.send(500,"text/plain","NVS save failed");return;}gConfig=next;if(oldPort!=gConfig.oscPort)restartOscListeners();MDNS_SetQlabDiscoveryEnabled(gConfig.qlabDiscovery);gWebServer.send(200,"text/plain","Saved and applied");}
+void restoreDefaults(){DeviceConfig next;Config_Defaults(next);if(!Config_Save(next)){gWebServer.send(500,"text/plain","NVS save failed");return;}gConfig=next;restartOscListeners();MDNS_SetQlabDiscoveryEnabled(gConfig.qlabDiscovery);gWebServer.send(200,"text/plain","Defaults restored");}
+void status(){JsonDocument d;JsonArray a=d["din"].to<JsonArray>(),b=d["relays"].to<JsonArray>();for(bool v:gDinState)a.add(dinStateName(v));for(bool v:Relay_Flag)b.add(v);d["maintenance"]=gMaintenance;d["ip"]=ETH_LocalIP().toString();d["qlabCount"]=MDNS_QlabCount();String out;serializeJson(d,out);gWebServer.send(200,"application/json",out);}
+void testDin(){int input=gWebServer.arg("input").toInt()-1;String eventName=gWebServer.arg("event");int event=eventName.equalsIgnoreCase("closed")||eventName.equalsIgnoreCase("low")?1:0;if(input<0||input>=DIN_COUNT||!gConfig.din[input][event][0].enabled){gWebServer.send(400,"text/plain","Invalid or disabled DIN message");return;}sendDinMessage(gConfig.din[input][event][0]);gWebServer.send(200,"text/plain","DIN message sent");}
+void testRelay(){if(gMaintenance){gWebServer.send(409,"text/plain","Firmware update in progress");return;}int relay=gWebServer.arg("relay").toInt()-1;int rule=gWebServer.arg("rule").toInt()-1;if(relay<0||relay>=RELAY_COUNT||rule<0||rule>=MAX_RELAY_RULES||!gConfig.relayOsc[relay][rule].enabled){gWebServer.send(400,"text/plain","Invalid or disabled relay rule");return;}auto&r=gConfig.relayOsc[relay][rule];RelayAction action=RelayRuleAction(rule);if(action==RELAY_ACTION_OFF)relaySet(relay,false);else if(action==RELAY_ACTION_ON)relaySet(relay,true);else relayPulse(relay,r.pulseDurationMs);gWebServer.send(200,"text/plain","Relay rule executed");}
+
+void setup(){delay(1000);Serial.begin(115200);gTcpOscQueue=xQueueCreate(kTcpOscQueueLength,sizeof(TcpOscJob));if(gTcpOscQueue!=nullptr)xTaskCreatePinnedToCore(tcpOscTask,"TcpOscTask",4096,nullptr,1,nullptr,1);Config_Load(gConfig);GPIO_Init();I2C_Init();Relay_Init();for(uint8_t i=0;i<8;i++){pinMode(kDinPins[i],INPUT_PULLUP);gDinState[i]=readDinClosed(kDinPins[i]);gDinCandidate[i]=gDinState[i];}uint64_t id=ESP.getEfuseMac();char hostname[24],instanceName[24];snprintf(hostname,sizeof(hostname),"spookio-%06X",(uint32_t)(id&0xffffff));snprintf(instanceName,sizeof(instanceName),"SpookIO-%06X",(uint32_t)(id&0xffffff));ETH_SetHostname(hostname);MDNS_Configure(hostname,gConfig.oscPort,instanceName);ETH_Init();for(uint16_t i=0;!ETH_Connected()&&i<100;i++){ETH_Loop();delay(100);}gOscUdp.begin(gConfig.oscPort);gArtNetUdp.begin(kArtNetPort);gSacnUdp.begin(kSacnPort);gOscTcpInput.begin(gConfig.oscPort);gWebServer.on("/",HTTP_GET,[](){gWebServer.send_P(200,"text/html; charset=utf-8",kIndexHtml);});gWebServer.on("/api/config",HTTP_GET,getConfig);gWebServer.on("/api/config",HTTP_POST,postConfig);gWebServer.on("/api/defaults",HTTP_POST,restoreDefaults);gWebServer.on("/api/status",HTTP_GET,status);gWebServer.on("/api/test/din",HTTP_POST,testDin);gWebServer.on("/api/test/relay",HTTP_POST,testRelay);const char* updateHeaders[]={"Content-Type","Content-Length","Transfer-Encoding"};gWebServer.collectHeaders(updateHeaders,3);gWebServer.addHandler(new FirmwareHttp(gFirmwareUpload,firmwareCapacity,firmwareInstalled));gWebServer.begin();MDNS_SetQlabDiscoveryEnabled(gConfig.qlabDiscovery);Serial.printf("OSC TCP SLIP/UDP %u, HTTP 80, Art-Net %u, sACN %u\n",gConfig.oscPort,kArtNetPort,kSacnPort);RGB_Light(0,0,0);Buzzer_Open_Time(150,0);}
+void loop(){
+  if(gRebootPending&&(int32_t)(millis()-gRebootAt)>=0){ESP.restart();return;}
+  if(gRebootPending){delay(1);return;}
+  ETH_Loop();MDNS_Loop();
+  if(!ETH_Connected()){gOscTcpInput.stop();gFirmwareUpload.disconnect();}
+  static bool wasConnected=false;
+  if(ETH_Connected()&&!wasConnected)restartOscListeners();
+  wasConnected=ETH_Connected();
+  if(ETH_Connected()&&!gMaintenance){handleUdpOsc();handleTcpOsc();handleArtNet();handleSacn();}
+  gWebServer.handleClient();
+  if(gResetHttpAfterUpdate){
+    // Drop HTTP test requests queued during a failed upload, after its response.
+    gWebServer.stop();gWebServer.begin();gResetHttpAfterUpdate=false;
+  }
+  if(!gMaintenance){pollDin();updateTimers();}
+}
