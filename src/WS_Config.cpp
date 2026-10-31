@@ -6,11 +6,22 @@
 namespace {
 constexpr uint32_t kConfigMagic = 0x524C5932; // RLY2
 constexpr char kNamespace[] = "relay-config";
-static_assert(sizeof(DeviceConfig) < 70000, "DeviceConfig exceeds the expanded NVS budget");
+constexpr char kPartition[] = "config";
+// NVS needs space for the old blob, its replacement, and garbage collection.
+static_assert(2 * sizeof(DeviceConfig) + 8192 < 65536, "DeviceConfig exceeds the configuration NVS budget");
 
 void setAddress(char *destination, size_t size, const char *value) {
   if (value == nullptr) value = "";
   strlcpy(destination, value, size);
+}
+
+bool readConfig(DeviceConfig &config, const char *partition) {
+  Preferences preferences;
+  if (!preferences.begin(kNamespace, true, partition)) return false;
+  bool valid = preferences.getBytesLength("blob") == sizeof(config) &&
+               preferences.getBytes("blob", &config, sizeof(config)) == sizeof(config);
+  preferences.end();
+  return valid && config.magic == kConfigMagic && config.version == CONFIG_VERSION;
 }
 }
 
@@ -47,31 +58,21 @@ void Config_Defaults(DeviceConfig &config) {
 }
 
 bool Config_Load(DeviceConfig &config) {
-  Preferences preferences;
-  if (!preferences.begin(kNamespace, true)) {
-    Config_Defaults(config);
+  if (readConfig(config, kPartition)) return true;
+  // Keep the original NVS partition untouched so installing the new partition
+  // table preserves settings and migration can be retried after a write error.
+  if (readConfig(config, nullptr)) {
     Config_Save(config);
-    return false;
+    return true;
   }
-
-  size_t length = preferences.getBytesLength("blob");
-  bool valid = length == sizeof(DeviceConfig);
-  if (valid) {
-    valid = preferences.getBytes("blob", &config, sizeof(config)) == sizeof(config);
-  }
-  preferences.end();
-
-  if (!valid || config.magic != kConfigMagic || config.version != CONFIG_VERSION) {
-    Config_Defaults(config);
-    Config_Save(config);
-    return false;
-  }
-  return true;
+  Config_Defaults(config);
+  Config_Save(config);
+  return false;
 }
 
 bool Config_Save(const DeviceConfig &config) {
   Preferences preferences;
-  if (!preferences.begin(kNamespace, false)) return false;
+  if (!preferences.begin(kNamespace, false, kPartition)) return false;
   size_t written = preferences.putBytes("blob", &config, sizeof(config));
   preferences.end();
   return written == sizeof(config);
@@ -132,20 +133,41 @@ bool Config_IsValid(const DeviceConfig &config, String &error) {
       for (uint8_t index = 0; index < MAX_DIN_MESSAGES; ++index) {
         const DinMessageConfig &message = config.din[input][event][index];
         if (!message.enabled) continue;
-        if (message.message[0] != '/' || strlen(message.message) >= OSC_MESSAGE_LENGTH || message.targetType > TARGET_QLAB || message.transport > OUTPUT_TCP || (message.targetType == TARGET_IP && message.port == 0) || (message.repeat && message.repeatIntervalMs < 20)) {
-          error = "Invalid DIN OSC message";
+        String context = String("Input ") + String(input + 1) + (event ? " Closed: " : " Open: ");
+        if (message.message[0] != '/') {
+          error = context + "OSC message must start with /";
+          return false;
+        }
+        if (strnlen(message.message, sizeof(message.message)) >= OSC_MESSAGE_LENGTH) {
+          error = context + "OSC message must be at most 192 characters";
+          return false;
+        }
+        if (message.targetType > TARGET_QLAB) {
+          error = context + "select IP address or QLab as the target";
+          return false;
+        }
+        if (message.transport > OUTPUT_TCP) {
+          error = context + "select UDP or TCP as the transport";
+          return false;
+        }
+        if (message.targetType == TARGET_IP && message.port == 0) {
+          error = context + "destination port must be 1–65535 (QLab usually uses 53000)";
+          return false;
+        }
+        if (message.repeat && message.repeatIntervalMs < 20) {
+          error = context + "repeat interval must be at least 20 ms when Repeat is enabled";
           return false;
         }
         ParsedOscText parsed;
         String parseError;
         if (!OscText_Parse(message.message, parsed, parseError)) {
-          error = "DIN message: " + parseError;
+          error = context + "OSC message: " + parseError;
           return false;
         }
         if (message.targetType == TARGET_IP) {
           IPAddress ip;
           if (!ip.fromString(message.target)) {
-            error = "DIN target must be an IPv4 address";
+            error = context + "enter a valid IPv4 target";
             return false;
           }
         }

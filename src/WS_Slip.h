@@ -35,3 +35,30 @@ class OscSlipInput {
   uint32_t started_ = 0;
   bool synced_ = false, escaped_ = false, bad_ = false, fragment_ = false;
 };
+
+// Stream OSC 1.1 SLIP in small chunks rather than placing a worst-case doubled
+// packet on the TCP worker's 4 KiB stack. A short write aborts this frame.
+template <class Write>
+bool OscSlipWrite(const uint8_t* payload, size_t size, Write write) {
+  if (!payload || !size || size > OscSlipInput::capacity) return false;
+  uint8_t chunk[128];
+  size_t used = 0;
+  auto flush = [&]() {
+    if (!used) return true;
+    bool ok = write(chunk, used) == used;
+    used = 0;
+    return ok;
+  };
+  auto append = [&](uint8_t byte) {
+    chunk[used++] = byte;
+    return used < sizeof(chunk) || flush();
+  };
+  if (!append(0xC0)) return false;
+  for (size_t i = 0; i < size; ++i) {
+    uint8_t byte = payload[i];
+    if (byte == 0xC0 || byte == 0xDB) {
+      if (!append(0xDB) || !append(byte == 0xC0 ? 0xDC : 0xDD)) return false;
+    } else if (!append(byte)) return false;
+  }
+  return append(0xC0) && flush();
+}

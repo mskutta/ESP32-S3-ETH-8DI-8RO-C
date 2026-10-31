@@ -6,7 +6,7 @@ Firmware for the Waveshare ESP32-S3-ETH-8DI-8RO-C industrial controller. It prov
 
 - Eight debounced digital inputs with configurable Open/Closed OSC messages.
 - One configurable message per input state, with one-shot or repeat delivery.
-- IPv4 and optional discovered QLab targets; UDP or length-prefixed TCP OSC output.
+- IPv4 and optional discovered QLab targets; UDP or OSC 1.1 SLIP TCP output.
 - Eight relays, each independently controlled by OSC, Art-Net, or sACN.
 - Three fixed OSC rules per relay—OFF, ON, and PULSE—with configurable matching and pulse duration.
 - Art-Net UDP `6454` and sACN UDP `5568` input.
@@ -35,14 +35,15 @@ TCP input accepts two simultaneous clients, up to 1024 decoded bytes per
 message, and closes connections with an incomplete frame after two seconds.
 Malformed or oversized SLIP frames are discarded through the next END byte.
 Disconnects, Ethernet loss, port changes, and restored defaults reset TCP input.
-Length-prefixed OSC 1.0 TCP input is no longer accepted. UDP input and outbound
-DIN OSC behavior remain unchanged; TCP **output** still uses length prefixes.
+Length-prefixed OSC 1.0 TCP is no longer used. Both TCP input and DIN TCP output
+use OSC 1.1 SLIP, including Send test and discovered QLab targets. UDP remains
+unchanged. Existing TCP output receivers must support SLIP.
 
 ## Web Configuration
 
 Open the device IP address in a browser. The page provides human-oriented forms for global settings, digital inputs, and relays, with conditional fields and inline validation. A read-only JSON preview is available for inspection. Save validates and applies the complete configuration atomically. The page also provides live input/relay status, per-message tests, relay rule tests, and a confirmed restore-defaults action.
 
-QLab discovery is optional. When enabled, the device browses `_qlab._udp`, displays discovered services through the status API, and QLab-targeted DIN messages fan out to discovered services. Targets are matched by mDNS hostname, retained through short discovery gaps, and expire after 30 seconds without a valid refresh. TCP OSC sends run in a background queue with a single 200 ms connection/write attempt; failed sends are rate-limited in the serial log.
+QLab discovery is optional. When enabled, the device browses `_qlab._udp`, displays discovered services through the status API, and QLab-targeted DIN messages fan out to discovered services. Targets are matched by mDNS hostname, retained through short discovery gaps, and expire after 30 seconds without a valid refresh. TCP OSC sends run in a background queue with one connection attempt and no retry. The connection timeout is 200 ms; failed sends are rate-limited in the serial log.
 
 ## Hardware
 
@@ -85,11 +86,16 @@ The PlatformIO environment is `esp32-s3-eth-8di-8ro-c`. Dependencies include Ard
 ## Ethernet firmware updates
 
 **Install this version once over USB with `pio run -t upload`.** This installs
-`partitions.csv`, containing two 7 MiB application slots. Uploading only an
+`partitions.csv`, containing two 7 MiB application slots and a dedicated 64 KiB
+`config` NVS partition. Uploading only an
 application binary cannot migrate the previous single-slot partition layout.
-The NVS location is retained; a normal USB upload and subsequent Ethernet
-updates preserve saved settings. Do not erase the flash if you want to retain
-settings.
+The original NVS location and both application slot locations are retained.
+Settings migrate from the original NVS partition into `config` on first boot,
+leaving the original copy intact. The larger partition has room for both the
+old configuration blob and its replacement during an atomic save. A normal
+USB upload and subsequent Ethernet updates preserve saved settings. Do not
+erase the flash if you want to retain settings. Devices with the earlier OTA
+layout but without `config` also need one USB upload to install this table.
 
 After USB installation, open `http://<device-ip>/`, find **Firmware update**,
 and select this project's `.pio/build/esp32-s3-eth-8di-8ro-c/firmware.bin`.
@@ -135,6 +141,8 @@ Tests include two TCP clients, fragmentation, escaping, coalesced frames,
 malformed/oversized frames, timeout/reconnect/port reset, upload retries,
 relay-off/flash/validation failures, disconnects, idle and total deadlines,
 invalid upload headers, and reboot signaling only after successful validation.
+The native suite also exercises configuration migration from legacy NVS,
+repeated saves, and preservation of the previous settings after write failures.
 Run `node scripts/test_web_ui.cjs` to check the embedded browser upload controls,
 including confirmation, progress, success, failure, and connection errors.
 

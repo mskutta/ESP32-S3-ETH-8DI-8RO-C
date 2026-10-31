@@ -31,6 +31,9 @@ constexpr uint32_t kTcpOscTimeoutMs=200;
 constexpr uint32_t kTcpFailureLogIntervalMs=5000;
 
 DeviceConfig gConfig;
+// HTTP requests run serially on the 8 KiB Arduino loop task. The configuration
+// is larger than that entire stack, so save/default staging must live in BSS.
+DeviceConfig gStagedConfig;
 bool gDinState[DIN_COUNT]={},gDinCandidate[DIN_COUNT]={};
 unsigned long gDinCandidateSince[DIN_COUNT]={},gDinLastSent[DIN_COUNT][DIN_EVENT_COUNT][MAX_DIN_MESSAGES]={},gLastDinPollMs=0;
 unsigned long gPulseTimers[RELAY_COUNT]={}; bool gPulseActive[RELAY_COUNT]={};
@@ -145,12 +148,27 @@ function renderVisibility(){
   for(let i=0;i<8;i++){let src=num('relay-'+i+'-source');$('relay-'+i+'-dmx').className=src==0?'hidden':'row';$('relay-'+i+'-rules').className=src==0?'':'hidden';for(let e=0;e<2;e++){let q=$('din-'+i+'-'+e+'-targetType');if(q){let isQ=Number(q.value)==1;$('din-'+i+'-'+e+'-target').parentElement.className=isQ?'hidden':'';$('din-'+i+'-'+e+'-port').parentElement.className=isQ?'hidden':''}}}
 }
 function updatePreview(){if($('jsonPreview')&&config){let copy=JSON.parse(JSON.stringify(config));delete copy._status;$('jsonPreview').textContent=JSON.stringify(copy,null,2)}}
+function validIpv4(value){let octets=value.split('.');return octets.length===4&&octets.every(octet=>/^\d{1,3}$/.test(octet)&&Number(octet)<=255)}
 function validate(){
   document.querySelectorAll('.error').forEach(x=>x.classList.remove('error'));let errors=[];
   if(num('oscPort')<1||num('oscPort')>65535){$('oscPort').classList.add('error');errors.push('Global: OSC port must be 1–65535')}
   for(let i=0;i<8;i++){let src=num('relay-'+i+'-source');if(src!=0&&num('relay-'+i+'-off')>num('relay-'+i+'-on')){errors.push('Relay '+(i+1)+': OFF level must not exceed ON level');$('relay-'+i+'-off').classList.add('error')}
-    for(let e=0;e<2;e++){let p='din-'+i+'-'+e+'-',m=$(p+'message');if($(p+'enabled').checked&&(!m.value.startsWith('/')||m.value.length>192)){m.classList.add('error');errors.push('Input '+(i+1)+' '+(e?'Closed':'Open')+': message must start with / and be at most 192 characters')}if($(p+'enabled').checked&&Number($(p+'targetType').value)==0&&!/^\\d{1,3}(\\.\d{1,3}){3}$/.test($(p+'target').value)){errors.push('Input '+(i+1)+' '+(e?'Closed':'Open')+': enter a valid IPv4 target')}}}
-  $('messages').innerHTML=errors.length?'<div class="errors">'+errors.join('\\n')+'</div>':'';return errors.length==0;
+    for(let e=0;e<2;e++){
+      let p='din-'+i+'-'+e+'-',context='Input '+(i+1)+' '+(e?'Closed':'Open')+': ';
+      if(!$(p+'enabled').checked)continue;
+      function problem(field,text){let element=$(p+field);element.classList.add('error');let section=element.closest('details');if(section)section.open=true;errors.push(context+text)}
+      let message=$(p+'message').value;
+      if(!message.startsWith('/'))problem('message','OSC message must start with /');
+      else if(message.length>192)problem('message','OSC message must be at most 192 characters');
+      if(Number($(p+'targetType').value)===0){
+        if(!validIpv4($(p+'target').value))problem('target','enter a valid IPv4 target');
+        let port=Number($(p+'port').value);
+        if(!Number.isInteger(port)||port<1||port>65535)problem('port','destination port must be 1–65535 (QLab usually uses 53000)');
+      }
+      if($(p+'repeat').checked){let interval=Number($(p+'repeatIntervalMs').value);if(!Number.isInteger(interval)||interval<20)problem('repeatIntervalMs','repeat interval must be at least 20 ms when Repeat is enabled')}
+    }
+  }
+  $('messages').innerHTML=errors.length?'<div class="errors">'+errors.join('\n')+'</div>':'';return errors.length==0;
 }
 async function saveConfig(){try{collect();if(!validate())return;let r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(config)}),text=await r.text();if(!r.ok)throw new Error(text||('HTTP '+r.status));showNotice(text||'Configuration saved');await loadConfig()}catch(error){showFailure('Save failed',error)}}
 async function loadConfig(){showNotice('Loading configuration…');try{config=await fetchJson('/api/config');let statusError=null;try{await loadStatus()}catch(error){statusError=error}render();if(statusError)showFailure('Configuration loaded, but status failed',statusError);else showNotice('Configuration loaded')}catch(error){showFailure('Configuration could not be rendered',error)}}
@@ -174,11 +192,9 @@ bool buildMessage(const char*text,OscMessage&m){ParsedOscText parsed;String erro
 bool sendTcpOscPayload(const char*host,uint16_t port,const uint8_t*payload,size_t payloadSize){
   if(host==nullptr||payload==nullptr||payloadSize==0||payloadSize>kOscPacketMax)return false;
   WiFiClient c;
-  c.setTimeout(kTcpOscTimeoutMs);
-  if(!c.connect(host,port))return false;
-  uint32_t n=payloadSize;
-  uint8_t h[4]={(uint8_t)(n>>24),(uint8_t)(n>>16),(uint8_t)(n>>8),(uint8_t)n};
-  bool ok=c.write(h,4)==4&&c.write(payload,payloadSize)==payloadSize;
+  c.setTimeout(1); // WiFiClient takes seconds; connect() takes milliseconds.
+  if(!c.connect(host,port,kTcpOscTimeoutMs))return false;
+  bool ok=OscSlipWrite(payload,payloadSize,[&](const uint8_t* data,size_t size){return c.write(data,size);});
   c.stop();
   return ok;
 }
@@ -305,8 +321,8 @@ size_t firmwareCapacity(){
 }
 void firmwareInstalled(){gRebootPending=true;gRebootAt=millis()+1000;}
 
-void postConfig(){JsonDocument d;auto err=deserializeJson(d,gWebServer.arg("plain"));if(err){gWebServer.send(400,"text/plain",err.c_str());return;}DeviceConfig next;String why;if(!configFromJson(d,next,why)){gWebServer.send(400,"text/plain",why);return;}uint16_t oldPort=gConfig.oscPort;if(!Config_Save(next)){gWebServer.send(500,"text/plain","NVS save failed");return;}gConfig=next;if(oldPort!=gConfig.oscPort)restartOscListeners();MDNS_SetQlabDiscoveryEnabled(gConfig.qlabDiscovery);gWebServer.send(200,"text/plain","Saved and applied");}
-void restoreDefaults(){DeviceConfig next;Config_Defaults(next);if(!Config_Save(next)){gWebServer.send(500,"text/plain","NVS save failed");return;}gConfig=next;restartOscListeners();MDNS_SetQlabDiscoveryEnabled(gConfig.qlabDiscovery);gWebServer.send(200,"text/plain","Defaults restored");}
+void postConfig(){JsonDocument d;auto err=deserializeJson(d,gWebServer.arg("plain"));if(err){gWebServer.send(400,"text/plain",err.c_str());return;}DeviceConfig& next=gStagedConfig;String why;if(!configFromJson(d,next,why)){gWebServer.send(400,"text/plain",why);return;}uint16_t oldPort=gConfig.oscPort;if(!Config_Save(next)){gWebServer.send(500,"text/plain","NVS save failed");return;}gConfig=next;if(oldPort!=gConfig.oscPort)restartOscListeners();MDNS_SetQlabDiscoveryEnabled(gConfig.qlabDiscovery);gWebServer.send(200,"text/plain","Saved and applied");}
+void restoreDefaults(){DeviceConfig& next=gStagedConfig;Config_Defaults(next);if(!Config_Save(next)){gWebServer.send(500,"text/plain","NVS save failed");return;}gConfig=next;restartOscListeners();MDNS_SetQlabDiscoveryEnabled(gConfig.qlabDiscovery);gWebServer.send(200,"text/plain","Defaults restored");}
 void status(){JsonDocument d;JsonArray a=d["din"].to<JsonArray>(),b=d["relays"].to<JsonArray>();for(bool v:gDinState)a.add(dinStateName(v));for(bool v:Relay_Flag)b.add(v);d["maintenance"]=gMaintenance;d["ip"]=ETH_LocalIP().toString();d["qlabCount"]=MDNS_QlabCount();String out;serializeJson(d,out);gWebServer.send(200,"application/json",out);}
 void testDin(){int input=gWebServer.arg("input").toInt()-1;String eventName=gWebServer.arg("event");int event=eventName.equalsIgnoreCase("closed")||eventName.equalsIgnoreCase("low")?1:0;if(input<0||input>=DIN_COUNT||!gConfig.din[input][event][0].enabled){gWebServer.send(400,"text/plain","Invalid or disabled DIN message");return;}sendDinMessage(gConfig.din[input][event][0]);gWebServer.send(200,"text/plain","DIN message sent");}
 void testRelay(){if(gMaintenance){gWebServer.send(409,"text/plain","Firmware update in progress");return;}int relay=gWebServer.arg("relay").toInt()-1;int rule=gWebServer.arg("rule").toInt()-1;if(relay<0||relay>=RELAY_COUNT||rule<0||rule>=MAX_RELAY_RULES||!gConfig.relayOsc[relay][rule].enabled){gWebServer.send(400,"text/plain","Invalid or disabled relay rule");return;}auto&r=gConfig.relayOsc[relay][rule];RelayAction action=RelayRuleAction(rule);if(action==RELAY_ACTION_OFF)relaySet(relay,false);else if(action==RELAY_ACTION_ON)relaySet(relay,true);else relayPulse(relay,r.pulseDurationMs);gWebServer.send(200,"text/plain","Relay rule executed");}

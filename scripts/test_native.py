@@ -16,3 +16,12 @@ with tempfile.TemporaryDirectory(prefix='spookio-tests-') as tmp:
                     '-I', str(root / 'src'), str(root / 'tests/test_network.cpp'),
                     '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
+
+with tempfile.TemporaryDirectory(prefix='spookio-config-tests-') as tmp:
+    binary = Path(tmp) / 'tests'
+    subprocess.run([compiler, '-std=c++17', '-Wall', '-Wextra', '-Werror', '-g',
+                    '-fsanitize=address,undefined', '-I', str(root / 'tests/stubs'),
+                    '-I', str(root / 'src'), str(root / 'src/WS_Config.cpp'),
+                    str(root / 'src/WS_OscText.cpp'), str(root / 'tests/test_config.cpp'),
+                    '-o', str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)

@@ -8,6 +8,7 @@
 class String : public std::string {
  public:
   using std::string::string;
+  explicit String(int value) : std::string(std::to_string(value)) {}
   String(const std::string& s) : std::string(s) {}
 };
 inline String operator+(const String& a, const char* b) { return String(std::string(a) + b); }

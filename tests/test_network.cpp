@@ -79,6 +79,31 @@ void framing() {
   Client flood=connect();for(int i=0;i<100;i++)append(flood,encoded);
   receiver.poll(2200,receive);assert(flood.available()>0);receiver.stop();
 }
+void outputFraming() {
+  std::vector<Bytes> packets{{'/', 'x', 0, 0, ',', 0, 0, 0}, Bytes(1024,0xC0), Bytes(1024,0xDB)};
+  Bytes allBytes;for(unsigned i=0;i<256;i++)allBytes.push_back(uint8_t(i));packets.push_back(allBytes);
+  for(auto& packet:packets) {
+    Bytes encoded;size_t largest=0;
+    assert(OscSlipWrite(packet.data(),packet.size(),[&](const uint8_t* data,size_t size){
+      if(size>largest)largest=size;
+      encoded.insert(encoded.end(),data,data+size);return size;
+    }));
+    assert(encoded==slip(packet));assert(largest<=128);
+    OscSlipInput decoder;size_t length=0;
+    for(auto byte:encoded)length=decoder.feed(byte,0);
+    assert(length==packet.size() && Bytes(decoder.data(),decoder.data()+length)==packet);
+  }
+  Bytes packet(1024,0xC0);int calls=0;
+  assert(!OscSlipWrite(packet.data(),packet.size(),[&](const uint8_t*,size_t size){++calls;return size-1;}));
+  assert(calls==1);
+  calls=0;
+  assert(!OscSlipWrite(packet.data(),packet.size(),[&](const uint8_t*,size_t size){return ++calls==2?0:size;}));
+  assert(calls==2);
+  auto failIfCalled=[](const uint8_t*,size_t)->size_t{assert(false);return 0;};
+  assert(!OscSlipWrite(nullptr,1,failIfCalled));
+  assert(!OscSlipWrite(packet.data(),0,failIfCalled));
+  assert(!OscSlipWrite(packet.data(),1025,failIfCalled));
+}
 void packetBounds() {
   Bytes noArgs{'/','x',0,0,',',0,0,0};
   assert(OscPacketValid(noArgs.data(),noArgs.size()));
@@ -193,4 +218,4 @@ void uploads() {
   {Fixture f;f.server.setLength(7);f.event(RAW_START);assert(f.server.code==400 && !f.backend.starts);}
   {Fixture f;testNow=0xFFFFFF00u;f.event(RAW_START);f.event(RAW_END);assert(f.upload.installed());}
 }
-int main() { framing();packetBounds();uploads();std::cout<<"SLIP receiver, OSC bounds, and firmware HTTP/lifecycle tests passed\n"; }
+int main() { framing();outputFraming();packetBounds();uploads();std::cout<<"SLIP receiver, OSC bounds, and firmware HTTP/lifecycle tests passed\n"; }
